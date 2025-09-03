@@ -1,0 +1,9 @@
+requests
+colorama
+tqdm
+argparse
+rich
+urllib3
+dnspython
+aiohttp
+beautifulsoup4
